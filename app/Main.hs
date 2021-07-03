@@ -3,34 +3,52 @@ module Main where
 import Graphics.X11.Xlib
 import Graphics.X11.Xlib.Extras
 import Graphics.X11.Xft
+import Graphics.X11.Xrender
 import System.Exit (exitWith, ExitCode(..))
 import Control.Concurrent
 import Control.Exception
+import Control.Monad (when)
 import Data.Bits ((.|.))
 import System.Process (readProcess)
 import System.Posix.Types (Fd(..))
 
+data UIComponent = UIComponent {
+    text  :: IO String
+  , color :: IO String -- "red" or "#ff0000"
+  , font  :: XftFont
+  , click :: IO ()
+  }
+
 main :: IO ()
 main = do
   initThreads
+  xftInitFtLibrary
   dpy     <- openDisplay ""
   root    <- rootWindow dpy (defaultScreen dpy)
   win     <- makeBar dpy root 15
-  selectInput dpy win (exposureMask .|. buttonPressMask)
-  xftInitFtLibrary
   font    <- xftFontOpen dpy (defaultScreenOfDisplay dpy) "scientifica"
+  selectInput dpy win (exposureMask .|. buttonPressMask)
   setTextProperty dpy win "Hello World" wM_NAME
-  loop dpy win font
+  loop dpy win [
+      -- UIComponent (show <$> battery) (return "#ff0000") font (return ())
+      batteryComp font
+    , brighnessComp font
+    , UIComponent (return "Hier" ) (return "#00ff00") font (return ())
+    , UIComponent (return "ist"  ) (return "#0000ff") font (return ())
+    , UIComponent (return "Luca" ) (return "#ffffff") font (return ())
+    ]
 
-loop :: Display -> Window -> XftFont -> IO ()
-loop dpy win font = do
+-- | Main game loop. Update all the windows, poll their requests, ...
+loop :: Display -> Window -> [UIComponent] -> IO ()
+loop dpy win uics = do
   putStrLn "looping"
   thread <- forkIO $ sendExposeEvent dpy win
   mapWindow dpy win
-  draw dpy win font
-  interactWindow dpy win (killThread thread)
-  loop dpy win font
+  draw dpy win uics
+  pollWindow dpy win [] (killThread thread)
+  loop dpy win uics
 
+-- | Make a simple window
 makeWindow :: Display -> Window -> Position -> Position -> Dimension -> Dimension -> IO Window
 makeWindow dpy root x y w h = allocaSetWindowAttributes $ \attr -> do
   initColor dpy "black" >>= set_backing_pixel attr
@@ -46,18 +64,23 @@ makeWindow dpy root x y w h = allocaSetWindowAttributes $ \attr -> do
         attrmask = cWOverrideRedirect .|. cWBackPixel
         visual = defaultVisualOfScreen (defaultScreenOfDisplay dpy)
 
+-- | Make a status bar window
 makeBar :: Display -> Window -> Dimension -> IO Window
 makeBar dpy root height = makeWindow dpy root 0 0 width height
   where
     width = widthOfScreen (defaultScreenOfDisplay dpy)
 
-interactWindow :: Display -> Window -> IO () -> IO ()
-interactWindow dpy win callback = allocaXEvent $ \e -> do
+-- | Poll all the Events the window listens to
+-- The events which are listened to are set by `selectInput ...`
+-- The callback is run after going through the list of events
+pollWindow :: Display -> Window -> [UIComponent] -> IO () -> IO ()
+pollWindow dpy win uics callback = allocaXEvent $ \e -> do
   nextEvent dpy e
   ev <- getEvent e
-  btn <- get_ButtonEvent e
-  putStrLn (eventName ev)
-  putStrLn (show btn)
+  when (eventName ev == "ButtonPress") (do
+    (_,_,_,x,y,_,_,_,_,_) <- get_ButtonEvent e
+    handleClicks dpy uics 0 0
+    )
   sync dpy True
   callback
 
@@ -71,26 +94,17 @@ sendExposeEvent dpy win = do
     sendEvent dpy win False noEventMask e
   sync dpy False
 
-draw :: Display -> Window -> XftFont -> IO ()
-draw dpy win font = do
-  bgcolor <- initColor dpy "black"
-  fgcolor <- initColor dpy "red"
+-- | Draw on a window
+draw :: Display -> Window -> [UIComponent] -> IO ()
+draw dpy win uics = do
   gc <- createGC dpy win
-  setBackground dpy gc bgcolor
-  setForeground dpy gc fgcolor
-  -- fillRectangle dpy win gc 0 0 100 100
-  -- setForeground dpy gc fgcolor
-  -- fillRectangle dpy win gc 2 2 96 96
-  -- drawText dpy win "scientifica" "red" 30 30 "Hier ist ein Text"
-  bat <- battery
-  light <- brighness
-  vol <- volume
-  drawText dpy win font "gray" 10 10
-    (  "Battery: "++slider 10 bat
-    ++ "Light: "++ slider 10 light
-    ++ "Volume: "++ slider 10 vol)
+  mapM_ (\(u,i) -> do
+    margin <- uicompSpacing dpy uics i
+    drawUIComp dpy win u margin 10)
+    (zip uics [0..])
   freeGC dpy gc
 
+-- | Draw text in a window
 drawText:: Display -> Window -> XftFont -> String -> Int -> Int -> String -> IO ()
 drawText dpy win font color x y text = do
   draw <- createDrawable
@@ -101,6 +115,15 @@ drawText dpy win font color x y text = do
     withColor :: String -> (XftColor -> IO a) -> IO a
     withColor = withXftColorName dpy visual colormap
     createDrawable = xftDrawCreate dpy win visual colormap
+
+drawUIComp :: Display -> Window -> UIComponent -> Int -> Int -> IO ()
+drawUIComp dpy win uic x y = do
+  color <- color uic
+  text  <- text uic
+  drawText dpy win (font uic) color x y text
+
+handleClicks :: Display -> [UIComponent] -> Int -> Int -> IO ()
+handleClicks dpy uics x y = undefined
 
 initColor :: Display -> String -> IO Pixel
 initColor dpy color = do
@@ -120,6 +143,41 @@ slider width val = [ if threshold i then '#' else '·' | i<-[1..width] ]
 
 wrap :: String -> String -> String -> String
 wrap l r c = l ++ c ++ r
+
+urgencyLevels :: Float -> Float -> Float -> String
+urgencyLevels hight low val
+  | val >= hight  = "#ff0000"
+  | val <= low    = "#00ffff"
+  | otherwise     = "#ffff00"
+
+uicompSpacing :: Display -> [UIComponent] -> Int -> IO Int
+uicompSpacing dpy uics i =
+  (+margin) . sum . map (+padding) . take i
+  <$> sequence [ width dpy u | u<-uics]
+  where
+    padding = 5
+    margin  = 10
+
+width :: Display -> UIComponent -> IO Int
+width dpy uic = do
+  text <- text uic
+  xglyphinfo_width <$> xftTextExtents dpy (font uic) text
+
+-- Components
+
+batteryComp font = UIComponent {
+    text  = show . round . (*100) <$> battery
+  , color = return "#eeeeee"
+  , font  = font
+  , click = return ()
+  }
+
+brighnessComp font = UIComponent {
+    text  = slider 10 <$> brighness
+  , color = return "#eeeeee"
+  , font  = font
+  , click = return ()
+  }
 
 -- Sensors
 
