@@ -5,15 +5,16 @@ import Graphics.X11.Xlib.Extras
 import Graphics.X11.Xft
 import Graphics.X11.Xrender
 import System.Exit (exitWith, ExitCode(..))
+import System.Environment (getArgs)
 import Control.Concurrent
 import Control.Exception
-import Control.Monad (when)
+import Control.Monad (when, void)
 import Data.Bits ((.|.))
 import System.Process (readProcess, readProcessWithExitCode, spawnProcess)
 import System.Posix.Types (Fd(..))
 
-data UIComponent = UIComponent {
-    text  :: IO String
+data UIComponent = UIComponent
+  { text  :: IO String
   , color :: IO String -- "red" or "#ff0000"
   , font  :: XftFont
   , click :: Percentage -> Percentage -> IO ()
@@ -21,37 +22,53 @@ data UIComponent = UIComponent {
 
 main :: IO ()
 main = do
+  args <- getArgs
   initThreads
   xftInitFtLibrary
   dpy     <- openDisplay ""
   root    <- rootWindow dpy (defaultScreen dpy)
-  win     <- makeBar dpy root 15
-  font    <- xftFontOpen dpy (defaultScreenOfDisplay dpy) "scientifica:size=9:antialias=false"
+  font    <- xftFontOpen dpy (defaultScreenOfDisplay dpy) (fontName args)
+  winHeig <- (+3) . fromIntegral <$> xftfont_height font
+  win     <- makeBar dpy root winHeig
   selectInput dpy win (exposureMask .|. buttonPressMask)
   setTextProperty dpy win "Hello World" wM_NAME
   loop dpy win
-    [
-      labelComp font "Bg: "
-    , brighnessComp font
+    [ menuComp font
+    , separatorComp font
+    , desktopButtonComp font 1 "Home"
+    , desktopButtonComp font 2 "Prog"
+    , desktopButtonComp font 3 "Surf"
+    , desktopButtonComp font 4 "Music"
+    , desktopButtonComp font 5 "Draw"
+    , desktopButtonComp font 6 "6"
+    , desktopButtonComp font 7 "7"
+    , desktopButtonComp font 8 "8"
+    , desktopButtonComp font 9 "9"
     ]
-    [
-      labelComp font "Bat: "
+    [ labelComp font "Bat: "
     , batteryComp font
-    , spacing font
+    , separatorComp font
     , labelComp font "Ram: "
     , ramComp font
-    , spacing font
+    , separatorComp font
     , labelComp font "Bg: "
     , brighnessComp font
-    , spacing font
+    , separatorComp font
     , labelComp font "Vol: "
     , volumeComp font
-    , spacing font
+    , separatorComp font
     , labelComp font "Heat: "
     , heatComp font
-    , spacing font
+    , separatorComp font
     , timeComp font
     ]
+    where
+      fontName :: [String] -> String
+      fontName args
+        | null (passedArg "--font=" args) = "scientifica:size=9:antialias=false"
+        | otherwise = drop 7 $ head $ passedArg "--font=" args
+      passedArg :: String -> [String] -> [String]
+      passedArg arg = filter (\v -> take (length arg) v == arg)
 
 -- | Main game loop. Update all the windows, poll their requests, ...
 loop :: Display -> Window -> [UIComponent] -> [UIComponent] -> IO ()
@@ -137,13 +154,15 @@ drawText dpy win font color x y text = do
 
 drawUIComp :: Display -> Window -> UIComponent -> Int -> Int -> IO ()
 drawUIComp dpy win uic x y = do
-  color <- color uic
-  text  <- text uic
-  widt <- width dpy uic
-  heig <- height dpy uic
+  color   <- color uic
+  text    <- text uic
+  widt    <- width dpy uic
+  heig    <- height dpy uic
+  ascent  <- xftfont_ascent  (font uic)
+  descent <- xftfont_descent (font uic) -- TODO: Fix positioning for different fonts
   clearArea dpy win
     (fromIntegral x)
-    (fromIntegral (y-8))
+    (fromIntegral (y-ascent))
     (fromIntegral widt)
     (fromIntegral heig)
     False
@@ -216,68 +235,92 @@ height dpy uic = do
 
 -- Components
 
-spacing font = UIComponent {
-    text  = return "|"
+separatorComp font = UIComponent
+  { text  = return "|"
   , color = return "#646464"
   , font  = font
   , click = \px py -> return ()
   }
 
-labelComp font label = UIComponent {
-    text  = return label
+labelComp :: XftFont -> String -> UIComponent
+labelComp font label = UIComponent
+  { text  = return label
   , color = return "#646464"
   , font  = font
   , click = \px py -> return ()
   }
 
-batteryComp font = UIComponent {
-    text  = show . round . (*100) <$> battery
+batteryComp :: XftFont -> UIComponent
+batteryComp font = UIComponent
+  { text  = show . round . (*100) <$> battery
   , color = return "#eeeeee"
   , font  = font
   , click = \px py -> return ()
   }
 
-brighnessComp font = UIComponent {
-    text  = slider 10 <$> brighness
+brighnessComp :: XftFont -> UIComponent
+brighnessComp font = UIComponent
+  { text  = slider 10 <$> brighness
   , color = return "#eeeeee"
   , font  = font
-  , click = \px py -> do
-    spawnProcess "sudo" ["light", "-S", show . (*100) $ px]
-    return ()
+  , click = \px py -> void
+    $ spawnProcess "sudo" ["light", "-S", show . (*100) $ px]
   }
 
-volumeComp font = UIComponent {
-    text  = slider 10 <$> volume
+volumeComp :: XftFont -> UIComponent
+volumeComp font = UIComponent
+  { text  = slider 10 <$> volume
   , color = return "#eeeeee"
   , font  = font
-  , click = \px py -> do
-    spawnProcess "pamixer" ["--set-volume", show . round . (*100) $ px]
-    print "change volume"
-    return ()
+  , click = \px py -> void
+    $ spawnProcess "pamixer" ["--set-volume", show . round . (*100) $ px]
   }
 
-heatComp font = UIComponent {
-    text  = show <$> heat
+heatComp :: XftFont -> UIComponent
+heatComp font = UIComponent
+  { text  = show <$> heat
   , color = urgencyLevels 75 55 . maximum <$> heat
   , font  = font
   , click = \px py -> return ()
   }
 
-timeComp font = UIComponent {
-    text  = time
+timeComp :: XftFont -> UIComponent
+timeComp font = UIComponent
+  { text  = time
   , color = return "#ababab"
   , font  = font
-  , click = \px py -> do
-    spawnProcess "xdg-open" ["https://calendar.google.com/"]
-    return ()
+  , click = \px py -> void $ spawnProcess "xdg-open" ["https://calendar.google.com/"]
   }
 
-ramComp font = UIComponent {
-    text  = (++"%") . show . round . (*100) <$> ram
+ramComp :: XftFont -> UIComponent
+ramComp font = UIComponent
+  { text  = (++"%") . show . round . (*100) <$> ram
   , color = return "#eeeeee"
   , font  = font
   , click = \px py -> return ()
   }
+
+
+menuComp :: XftFont -> UIComponent
+menuComp font = UIComponent
+  { text  = return "menu"
+  , color = return "#ffffff"
+  , font  = font
+  , click = \px py -> void $ spawnProcess "jgmenu_run" []
+  }
+
+desktopButtonComp :: XftFont -> Int -> String -> UIComponent
+desktopButtonComp font  num name = UIComponent
+  { text  = return name
+  , color = return visibleColor
+  , font  = font
+  , click = \px py -> void $ spawnProcess "xdotool" ["key", "super+"++show num]
+  }
+  where
+    currentColor = "#c3e88d"
+    visibleColor = "#c792ea"
+    hiddenColor  = "#82AAFF"
+    urgentColor  = "#C45500"
 
 -- Sensors
 
